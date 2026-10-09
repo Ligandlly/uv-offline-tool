@@ -1,0 +1,70 @@
+name: Download uv tool wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: "Python 版本，例如 3.12"
+        required: true
+        default: "3.12"
+      packages:
+        description: "包名，多个用空格分隔，例如：ruff black mypy"
+        required: true
+        default: "ruff"
+
+jobs:
+  download-wheels:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Download wheels
+        env:
+          PACKAGES: ${{ inputs.packages }}
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+          mkdir -p wheels
+
+          python - <<'PY'
+          import os
+          import shlex
+          import subprocess
+          import sys
+
+          raw = os.environ.get("PACKAGES", "")
+          packages = shlex.split(raw)
+
+          if not packages:
+              sys.exit("packages is empty")
+
+          cmd = [
+              sys.executable,
+              "-m",
+              "pip",
+              "download",
+              "--dest",
+              "wheels",
+              "--only-binary=:all:",
+              *packages,
+          ]
+
+          print("Running:", " ".join(cmd))
+          subprocess.check_call(cmd)
+          PY
+
+          echo "Downloaded files:"
+          ls -lh wheels
+
+      - name: Upload wheels artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uv-wheels-py${{ inputs.python_version }}-${{ github.run_id }}
+          path: wheels/
+          if-no-files-found: error
+          retention-days: 30
