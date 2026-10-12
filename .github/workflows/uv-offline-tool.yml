@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -132,10 +135,22 @@ jobs:
           echo "name=${slug}-py${py}" >> "$GITHUB_OUTPUT"
           echo "产物名: ${slug}-py${py}"
 
-      - name: Upload wheels artifact
+      - name: Package install.sh + wheels archive
+        env:
+          NAME: ${{ steps.artifact_name.outputs.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf "dist/${NAME}-wheels.tar.gz" -C . wheels
+          cp install.sh "dist/install.sh"
+          chmod +x "dist/install.sh"
+          echo "产物内容:"
+          ls -lh dist
+
+      - name: Upload artifact (install.sh + wheels archive)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifact_name.outputs.name }}
-          path: wheels/
+          path: dist/
           if-no-files-found: error
           retention-days: 30

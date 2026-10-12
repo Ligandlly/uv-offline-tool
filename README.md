@@ -3,18 +3,19 @@
 在**联网的机器**上用 GitHub Actions 把 Python 包的 wheel / sdist 全部下载好，再在**离线机器**上一条命令装完 —— 不需要 PyPI，不需要内网镜像源。
 
 ```
-GitHub Actions (联网)                     离线机器
-┌──────────────────────────┐             ┌────────────────────────────┐
-│ uv-offline-tool.yml      │  artifact   │ ./install.sh -w <zip> --   │
-│ pip download → wheels/   │ ──zip─────▶ │ uv/pip install --no-index  │
-└──────────────────────────┘             └────────────────────────────┘
+GitHub Actions (联网)                                离线机器
+┌───────────────────────────┐                      ┌────────────────────────────┐
+│ uv-offline-tool.yml       │      artifact        │ 解压后 ./install.sh -- <包>  │
+│ pip download → wheels/    │ ───zip（内含───────▶ │ 或 -w <zip|tar.gz|wheels>  │
+│ → install.sh + *.tar.gz   │   install.sh+压缩包） │ uv/pip install --no-index  │
+└───────────────────────────┘                      └────────────────────────────┘
 ```
 
 ## 仓库结构
 
 ```
-.github/workflows/uv-offline-tool.yml   下载产物的 workflow（手动触发）
-install.sh                              离线安装脚本（通用，任意包）
+.github/workflows/uv-offline-tool.yml   下载 + 打包 artifact 的 workflow（手动触发）
+install.sh                              离线安装脚本（通用，任意包；artifact 里也带一份）
 ```
 
 ## 快速开始
@@ -39,16 +40,34 @@ Actions → **Download uv tool wheels** → *Run workflow*，填两个输入：
 
 文件名里不允许的字符（`: < > | " / \ * ?`、空格等）会统一换成 `-`，下载下来的 zip 就是 `<artifact 名>.zip`。
 
+每个 artifact 里只有两个文件：
+
+```
+qwenpaw-hub-py3.12.zip          # 从 Actions 下载的 artifact
+├── install.sh                  # 离线安装脚本
+└── qwenpaw-hub-py3.12-wheels.tar.gz   # 所有 wheel / sdist 的压缩包
+```
+
 > 例：`python_version=3.12`、`packages=qwenpaw[hub]` 会得到约 240 MB 的产物。
 
 ### 2. 在离线机器上安装
 
+把 artifact zip 拷过去，解压后目录里就有 `install.sh`，直接跑即可（脚本会自动找到旁边的 wheels 压缩包）：
+
 ```bash
-# 拉取仓库（或在联网机器上把 install.sh 一起带过去），然后：
-./install.sh -w qwenpaw-hub-py3.12.zip -- 'qwenpaw[hub]'
+unzip qwenpaw-hub-py3.12.zip
+./install.sh -- 'qwenpaw[hub]'
 ```
 
-脚本会自动解压 zip、新建虚拟环境 `./.uv-offline-venv`、用 `--no-index` 从产物目录安装。
+也可以不手动解压，把 zip / 压缩包直接交给脚本：
+
+```bash
+./install.sh -w qwenpaw-hub-py3.12.zip -- 'qwenpaw[hub]'          # artifact zip
+./install.sh -w qwenpaw-hub-py3.12-wheels.tar.gz -- 'qwenpaw[hub]' # 只给 wheels 压缩包
+./install.sh -w ./wheels -- 'qwenpaw[hub]'                         # 已解压的 wheels 目录
+```
+
+脚本会新建虚拟环境 `./.uv-offline-venv`，并用 `--no-index` 从产物里完成安装。
 
 常用变体：
 
@@ -74,7 +93,7 @@ Actions → **Download uv tool wheels** → *Run workflow*，填两个输入：
 
 | 选项 | 说明 |
 | --- | --- |
-| `-w, --wheels PATH` | 产物目录，或 Actions 下载的 artifact `*.zip`。留空时自动探测 `./wheels`、`./uv-wheels-*`、`./*/wheels`（解压后的产物）以及当前目录的 `*.zip` |
+| `-w, --wheels PATH` | 产物位置，可以是：wheels 目录、artifact `*.zip`、`*wheels.tar.gz`。留空时自动探测 `./wheels`、`./*/wheels`（解压后的 artifact）、当前目录下的压缩包 |
 | `-m, --mode MODE` | `venv`（默认，新建/复用虚拟环境）、`tool`（`uv tool install`）、`pip`（直接装进 `--python` 解释器） |
 | `-p, --python PATH` | 解释器，默认 `python3`；也是 venv 的基础解释器 |
 | `-e, --env DIR` | `mode=venv` 的虚拟环境目录，默认 `./.uv-offline-venv` |
@@ -99,6 +118,7 @@ Actions → **Download uv tool wheels** → *Run workflow*，填两个输入：
 2. **第二轮：放宽** —— 只要有包没有 wheel（如 `oss2`、`crcmod`、`alibabacloud-tea` 只发布 sdist），自动改为「优先 wheel，缺 wheel 时用 sdist」重试，并在日志里 `::warning::` 指出是哪些包。
 3. **附带构建依赖** —— 若产物里出现 `.tar.gz`，再补下载 `setuptools`、`wheel`，保证离线机器能构建这些 sdist。
 4. 若两轮都失败，报错并提示原因（如 Python 版本不满足包的 `requires-python`，例如 `qwenpaw` 只支持 `3.11 ≤ x < 3.14`）。
+5. **打包** —— 把 `wheels/` 压成 `<artifact 名>-wheels.tar.gz`，连同仓库里的 `install.sh` 一起上传；下载下来只用一份 artifact 就能离线安装。
 
 ## 常见问题
 

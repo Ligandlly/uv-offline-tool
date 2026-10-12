@@ -3,10 +3,10 @@
 # wheel/sdist 产物。不针对任何特定包：包名、模式、解释器都可指定。
 #
 # 典型用法：
-#   ./install.sh -w qwenpaw-hub-py3.12.zip -- 'qwenpaw[hub]'
-#   ./install.sh -w ./wheels --mode tool -- ruff black
-#   ./install.sh --mode venv -e .venv -- some-package==1.2.3
-#   ./install.sh -w ./wheels --list
+#   解压 artifact 后直接跑：  ./install.sh -- 'qwenpaw[hub]'
+#   直接用 artifact zip：      ./install.sh -w qwenpaw-hub-py3.12.zip -- 'qwenpaw[hub]'
+#   直接用 wheels 压缩包：     ./install.sh -w qwenpaw-hub-py3.12-wheels.tar.gz -- 'qwenpaw[hub]'
+#   装成命令行工具：           ./install.sh -w ./wheels -m tool -- ruff black
 #
 # 说明：安装时始终使用 --no-index（只用本地目录当包源），默认给 uv 再加 --offline，
 # 因此不会向 PyPI 发请求。
@@ -35,8 +35,9 @@ usage() {
         注意必须加 '--'，避免包名被当成选项。
 
 选项:
-  -w, --wheels PATH     wheel/sdist 所在目录，或 Actions 下载的 artifact zip。
-                        留空时自动探测: ./wheels、./uv-wheels-*、./*/wheels、当前目录下的 *.zip
+  -w, --wheels PATH     产物位置，可以是：wheels 目录、artifact zip、*wheels.tar.gz。
+                        留空时自动探测: ./wheels、./*/wheels（已解压的 artifact）、
+                        当前目录下的压缩包
   -m, --mode MODE       tool  = uv tool install（全局命令行工具，生成 ~/.local/bin 下的命令）
                         venv  = 新建/复用一个虚拟环境再安装（默认）
                         pip   = 直接装进 --python 指定的解释器
@@ -50,8 +51,8 @@ usage() {
   -h, --help            显示本帮助
 
 示例:
-  $SCRIPT_NAME -w qwenpaw-hub-py3.12.zip -- 'qwenpaw[hub]'
-  $SCRIPT_NAME -w ./wheels -m tool -- ruff
+  $SCRIPT_NAME -- 'qwenpaw[hub]'                    # 在解压后的 artifact 目录里
+  $SCRIPT_NAME -w qwenpaw-hub-py3.12.zip -- ruff
   $SCRIPT_NAME -w ./wheels -m pip -p /usr/bin/python3.12 -- black mypy
 EOF
 }
@@ -94,30 +95,91 @@ if [ "$MODE" = tool ] && [ "$HAVE_UV" = 0 ]; then
   die "mode=tool 需要 uv（离线机器请先准备 uv，或用 -m venv / -m pip）"
 fi
 
-# ---------- 定位产物目录 ----------
-resolve_wheels() {    # 把结果写进全局 WHEELS（因此不能用 $(...) 调用，否则 TMP_DIR 留在子 shell 里清不掉）
-  local src=$1 dest
-  if [ -d "$src" ]; then WHEELS=${src%/}; return 0; fi
-  if [ -f "$src" ]; then
-    case $src in
-      *.zip)
-        # 注意：TMP_DIR 必须在当前 shell 里赋值（后面 cleanup 才能清掉解压目录）
-        [ -n "$TMP_DIR" ] || TMP_DIR=$(mktemp -d)
-        log "解压 $src -> $TMP_DIR"
-        if command -v unzip >/dev/null 2>&1; then
-          unzip -q "$src" -d "$TMP_DIR"
-        else
-          "$PYTHON" -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$src" "$TMP_DIR"
-        fi
-        if [ -d "$TMP_DIR/wheels" ]; then WHEELS=$TMP_DIR/wheels; return 0; fi
-        dest=$(find "$TMP_DIR" -name '*.whl' -o -name '*.tar.gz' | head -n1 || true)
-        if [ -n "$dest" ]; then WHEELS=$(dirname "$dest"); return 0; fi
-        die "zip 里没有找到 .whl/.tar.gz: $src"
-        ;;
-      *) die "不支持的产物文件（需要目录或 .zip）: $src" ;;
-    esac
+# ---------- 定位产物 ----------
+# artifact 的形态可能是：
+#   1) wheels/ 目录
+#   2) artifact zip（内含 install.sh + *-wheels.tar.gz）
+#   3) wheels 压缩包（*wheels.tar.gz）
+#   4) 已解压的 artifact 目录（含 install.sh + *-wheels.tar.gz）
+dir_has_packages() {  # 目录里是否直接含 wheel / sdist（注意排除「装着 wheel 的压缩包」）
+  local d=$1 f
+  ls "$d"/*.whl >/dev/null 2>&1 && return 0
+  for f in "$d"/*.tar.gz; do
+    [ -f "$f" ] || continue
+    is_bundle_archive "$f" || return 0
+  done
+  return 1
+}
+
+ensure_tmp() { [ -n "$TMP_DIR" ] || TMP_DIR=$(mktemp -d); }
+
+is_bundle_archive() {  # 压缩包里是否装着 wheel/sdist（区别于 sdist 源码包）
+  local f=$1 names
+  case $f in
+    *.zip)
+      if command -v unzip >/dev/null 2>&1; then
+        names=$(unzip -Z1 "$f" 2>/dev/null || true)
+      else
+        names=$("$PYTHON" -c 'import sys, zipfile; print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))' "$f" 2>/dev/null || true)
+      fi
+      ;;
+    *.tar.gz|*.tgz) names=$(tar -tzf "$f" 2>/dev/null || true) ;;
+    *) return 1 ;;
+  esac
+  # 用 here-string，避开 pipefail + grep -q 早退导致上游 SIGPIPE 的假失败
+  grep -qE '\.(whl|tar\.gz|tgz)$' <<<"$names"
+}
+
+unpack_archive() {  # $1=压缩包 $2=目标目录
+  local f=$1 dest=$2
+  mkdir -p "$dest"
+  case $f in
+    *.zip)
+      if command -v unzip >/dev/null 2>&1; then
+        unzip -q "$f" -d "$dest"
+      else
+        "$PYTHON" -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$f" "$dest"
+      fi
+      ;;
+    *) tar -xzf "$f" -C "$dest" ;;
+  esac
+}
+
+# 在一个已解开的目录里找 wheel/sdist（必要时递归解开嵌套压缩包），结果写进全局 WHEELS
+resolve_in() {
+  local root=$1 depth=$2 sub entry
+  [ -d "$root" ] || return 1
+  if [ -d "$root/wheels" ] && dir_has_packages "$root/wheels"; then WHEELS=$root/wheels; return 0; fi
+  if dir_has_packages "$root"; then WHEELS=${root%/}; [ -n "$WHEELS" ] || WHEELS=.; return 0; fi
+  [ "$depth" -ge 3 ] && return 1
+  while IFS= read -r entry; do
+    is_bundle_archive "$entry" || continue
+    ensure_tmp
+    sub=$(mktemp -d "$TMP_DIR/unpack.XXXXXX")
+    log "解压 $entry"
+    unpack_archive "$entry" "$sub"
+    resolve_in "$sub" $((depth + 1)) && return 0
+  done < <(find "$root" -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.tgz' \) 2>/dev/null | head -n 50)
+  return 1
+}
+
+resolve_wheels() {  # 把结果写进全局 WHEELS（不能用 $(...) 调用，否则 TMP_DIR 留在子 shell 里清不掉）
+  local src=$1 sub
+  if [ -d "$src" ]; then
+    resolve_in "${src%/}" 0 || die "$src 里没有找到 .whl/.tar.gz"
+    return 0
   fi
-  die "产物路径不存在: $src"
+  [ -f "$src" ] || die "产物路径不存在: $src"
+  case $src in
+    *.zip|*.tar.gz|*.tgz)
+      ensure_tmp
+      sub=$(mktemp -d "$TMP_DIR/unpack.XXXXXX")
+      log "解压 $src"
+      unpack_archive "$src" "$sub"
+      resolve_in "$sub" 1 || die "$src 里没有找到 .whl/.tar.gz"
+      ;;
+    *) die "不支持的产物文件（需要目录、.zip 或 .tar.gz）: $src" ;;
+  esac
 }
 
 if [ -n "$WHEELS_SRC" ]; then
@@ -125,19 +187,20 @@ if [ -n "$WHEELS_SRC" ]; then
   resolve_wheels "$WHEELS_SRC"
 else
   WHEELS=
-  shopt -s nullglob
+  # 1) 各种已解开的目录：./wheels、./<artifact 名>/wheels、含压缩包的解压目录……
   for cand in ./wheels ./uv-wheels-* ./*/wheels ./*/uv-wheels-* ./*; do
     [ -d "$cand" ] || continue
-    files=("$cand"/*.whl "$cand"/*.tar.gz)
-    if [ ${#files[@]} -gt 0 ]; then WHEELS=$cand; break; fi
+    resolve_in "$cand" 0 && break
   done
-  shopt -u nullglob
+  # 2) 当前目录下的 artifact zip / wheels 压缩包
   if [ -z "$WHEELS" ]; then
-    for z in ./*.zip; do
-      if [ -f "$z" ]; then resolve_wheels "$z"; break; fi
+    shopt -s nullglob
+    for cand in ./*.zip ./*.tar.gz ./*.tgz; do
+      if [ -f "$cand" ] && is_bundle_archive "$cand"; then resolve_wheels "$cand"; break; fi
     done
+    shopt -u nullglob
   fi
-  [ -n "$WHEELS" ] || die "没找到产物目录，请用 -w 指定（目录或 artifact zip）"
+  [ -n "$WHEELS" ] || die "没找到产物，请用 -w 指定（wheels 目录 / artifact zip / *wheels.tar.gz）"
   log "自动探测到产物目录: $WHEELS"
 fi
 
@@ -177,7 +240,7 @@ wheel_tag_matches() {  # $1 = wheel 路径
   [ -z "$TAGS" ] && return 1
   local IFS=.
   for p in $plat; do
-    printf '%s\n' "$TAGS" | grep -qxF "$py-$abi-$p" && return 0
+    grep -qxF "$py-$abi-$p" <<<"$TAGS" && return 0
   done
   return 1
 }
