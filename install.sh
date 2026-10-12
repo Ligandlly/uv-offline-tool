@@ -3,7 +3,7 @@
 # wheel/sdist 产物。不针对任何特定包：包名、模式、解释器都可指定。
 #
 # 典型用法：
-#   ./install.sh -w uv-wheels-py3.12-123456.zip -- 'qwenpaw[hub]'
+#   ./install.sh -w qwenpaw-hub-py3.12.zip -- 'qwenpaw[hub]'
 #   ./install.sh -w ./wheels --mode tool -- ruff black
 #   ./install.sh --mode venv -e .venv -- some-package==1.2.3
 #   ./install.sh -w ./wheels --list
@@ -36,7 +36,7 @@ usage() {
 
 选项:
   -w, --wheels PATH     wheel/sdist 所在目录，或 Actions 下载的 artifact zip。
-                        留空时自动探测: ./wheels、./uv-wheels-*、当前目录下的 *.zip
+                        留空时自动探测: ./wheels、./uv-wheels-*、./*/wheels、当前目录下的 *.zip
   -m, --mode MODE       tool  = uv tool install（全局命令行工具，生成 ~/.local/bin 下的命令）
                         venv  = 新建/复用一个虚拟环境再安装（默认）
                         pip   = 直接装进 --python 指定的解释器
@@ -50,7 +50,7 @@ usage() {
   -h, --help            显示本帮助
 
 示例:
-  $SCRIPT_NAME -w uv-wheels-py3.12-38188961568.zip -- 'qwenpaw[hub]'
+  $SCRIPT_NAME -w qwenpaw-hub-py3.12.zip -- 'qwenpaw[hub]'
   $SCRIPT_NAME -w ./wheels -m tool -- ruff
   $SCRIPT_NAME -w ./wheels -m pip -p /usr/bin/python3.12 -- black mypy
 EOF
@@ -125,9 +125,13 @@ if [ -n "$WHEELS_SRC" ]; then
   resolve_wheels "$WHEELS_SRC"
 else
   WHEELS=
-  for cand in ./wheels ./uv-wheels-*; do
-    if [ -d "$cand" ]; then WHEELS=$cand; break; fi
+  shopt -s nullglob
+  for cand in ./wheels ./uv-wheels-* ./*/wheels ./*/uv-wheels-* ./*; do
+    [ -d "$cand" ] || continue
+    files=("$cand"/*.whl "$cand"/*.tar.gz)
+    if [ ${#files[@]} -gt 0 ]; then WHEELS=$cand; break; fi
   done
+  shopt -u nullglob
   if [ -z "$WHEELS" ]; then
     for z in ./*.zip; do
       if [ -f "$z" ]; then resolve_wheels "$z"; break; fi

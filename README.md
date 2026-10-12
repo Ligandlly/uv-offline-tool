@@ -28,7 +28,16 @@ Actions → **Download uv tool wheels** → *Run workflow*，填两个输入：
 | `python_version` | 目标机上的 Python 版本，如 `3.12` | `3.12` |
 | `packages` | 包名，空格分隔；可带版本/extras，如 `qwenpaw[hub] ruff==0.6.9` | `ruff` |
 
-跑完后在该次 run 页面底部下载 artifact，名字形如 `uv-wheels-py3.12-38189971866`（保留 30 天）。
+跑完后在该次 run 页面底部下载 artifact，名字由**包名 + Python 版本**拼成（保留 30 天）：
+
+| `packages` 输入 | artifact 名 |
+| --- | --- |
+| `ruff` | `ruff-py3.12` |
+| `qwenpaw[hub]` | `qwenpaw-hub-py3.12` |
+| `black mypy` | `black-mypy-py3.12` |
+| `ruff==0.6.9` | `ruff-0.6.9-py3.12` |
+
+文件名里不允许的字符（`: < > | " / \ * ?`、空格等）会统一换成 `-`，下载下来的 zip 就是 `<artifact 名>.zip`。
 
 > 例：`python_version=3.12`、`packages=qwenpaw[hub]` 会得到约 240 MB 的产物。
 
@@ -36,7 +45,7 @@ Actions → **Download uv tool wheels** → *Run workflow*，填两个输入：
 
 ```bash
 # 拉取仓库（或在联网机器上把 install.sh 一起带过去），然后：
-./install.sh -w uv-wheels-py3.12-38189971866.zip -- 'qwenpaw[hub]'
+./install.sh -w qwenpaw-hub-py3.12.zip -- 'qwenpaw[hub]'
 ```
 
 脚本会自动解压 zip、新建虚拟环境 `./.uv-offline-venv`、用 `--no-index` 从产物目录安装。
@@ -65,7 +74,7 @@ Actions → **Download uv tool wheels** → *Run workflow*，填两个输入：
 
 | 选项 | 说明 |
 | --- | --- |
-| `-w, --wheels PATH` | 产物目录，或 Actions 下载的 artifact `*.zip`。留空时自动探测 `./wheels`、`./uv-wheels-*`、当前目录的 `*.zip` |
+| `-w, --wheels PATH` | 产物目录，或 Actions 下载的 artifact `*.zip`。留空时自动探测 `./wheels`、`./uv-wheels-*`、`./*/wheels`（解压后的产物）以及当前目录的 `*.zip` |
 | `-m, --mode MODE` | `venv`（默认，新建/复用虚拟环境）、`tool`（`uv tool install`）、`pip`（直接装进 `--python` 解释器） |
 | `-p, --python PATH` | 解释器，默认 `python3`；也是 venv 的基础解释器 |
 | `-e, --env DIR` | `mode=venv` 的虚拟环境目录，默认 `./.uv-offline-venv` |

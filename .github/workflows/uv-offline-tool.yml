@@ -114,10 +114,28 @@ jobs:
             echo "::warning::下载内容含源码包（sdist），体积/安装请配合仓库根目录的 install.sh（会用 --no-index 从本地目录构建）"
           fi
 
+      - name: Compute artifact name
+        id: artifact_name
+        env:
+          PACKAGES: ${{ inputs.packages }}
+          PY_VERSION: ${{ inputs.python_version }}
+        run: |
+          set -euo pipefail
+          # 用包名命名产物（如 "qwenpaw[hub]" -> qwenpaw-hub-py3.12）
+          # artifact 名不允许 : < > | " / \ * ?，统一替换成 -
+          slug=$(printf '%s' "$PACKAGES" \
+            | tr ' ' '-' \
+            | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/-+/-/g; s/^[-.]+//; s/[-.]+$//' \
+            | cut -c1-80)
+          [ -n "$slug" ] || slug=packages
+          py=$(printf '%s' "$PY_VERSION" | sed -E 's/[^A-Za-z0-9._-]+/-/g')
+          echo "name=${slug}-py${py}" >> "$GITHUB_OUTPUT"
+          echo "产物名: ${slug}-py${py}"
+
       - name: Upload wheels artifact
         uses: actions/upload-artifact@v4
         with:
-          name: uv-wheels-py${{ inputs.python_version }}-${{ github.run_id }}
+          name: ${{ steps.artifact_name.outputs.name }}
           path: wheels/
           if-no-files-found: error
           retention-days: 30
