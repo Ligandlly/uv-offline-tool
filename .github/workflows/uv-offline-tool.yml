@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       python_version:
-        description: "Python 版本，例如 3.12"
+        description: "Python 版本，例如 3.12（注意包自身的 requires-python，如 qwenpaw 仅支持 3.11~3.13）"
         required: true
         default: "3.12"
       packages:
-        description: "包名，多个用空格分隔，例如：ruff black mypy"
+        description: "包名，多个用空格分隔，例如：ruff black mypy（需要固定版本可写成 qwenpaw==2.2.1）"
         required: true
         default: "ruff"
 
@@ -33,33 +33,76 @@ jobs:
 
           python - <<'PY'
           import os
+          import re
           import shlex
           import subprocess
           import sys
 
-          raw = os.environ.get("PACKAGES", "")
-          packages = shlex.split(raw)
+          packages = shlex.split(os.environ.get("PACKAGES", ""))
 
           if not packages:
               sys.exit("packages is empty")
 
-          cmd = [
-              sys.executable,
-              "-m",
-              "pip",
-              "download",
-              "--dest",
-              "wheels",
-              "--only-binary=:all:",
-              *packages,
-          ]
+          # pip 在 "只要 wheel" 模式下会把没有 wheel 的包报成这两种错误
+          REQ_RE = re.compile(
+              r"(?:Could not find a version that satisfies the requirement|"
+              r"No matching distribution found for)\s+([^\s(]+)"
+          )
 
-          print("Running:", " ".join(cmd))
-          subprocess.check_call(cmd)
+          def name_of(spec):
+              # oss2[kerberos]>=2.19.1 -> oss2
+              return re.split(r"[\[\]<>=!~;]", spec, 1)[0]
+
+          def run(only_binary):
+              cmd = [sys.executable, "-m", "pip", "download", "--dest", "wheels"]
+              if only_binary:
+                  cmd.append("--only-binary=:all:")
+              cmd += packages
+              print("Running:", " ".join(cmd), flush=True)
+              return subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+
+          def show(res):
+              print(res.stdout, end="", flush=True)
+              print(res.stderr, end="", file=sys.stderr, flush=True)
+
+          # 第一轮：只要 wheel（最理想的离线产物）
+          res = run(only_binary=True)
+          show(res)
+
+          # 第二轮：只要有包没 wheel，就放宽为「优先 wheel、必要时用 sdist」
+          if res.returncode != 0:
+              lacking = sorted(
+                  {
+                      name_of(m.group(1))
+                      for m in REQ_RE.finditer(res.stdout + res.stderr)
+                  }
+              )
+              if lacking:
+                  print(
+                      "::warning::以下包没有可用 wheel（或当前 Python 版本不兼容），"
+                      "已放宽为允许 sdist 重试: " + " ".join(lacking),
+                      flush=True,
+                  )
+              else:
+                  print("::warning::未找到纯 wheel 方案，已放宽为允许 sdist 重试", flush=True)
+              res = run(only_binary=False)
+              show(res)
+
+          if res.returncode != 0:
+              print(
+                  "::error::下载失败；若日志提示 'require a different python version'，"
+                  "说明当前 Python 版本不满足包的 requires-python 约束，请改用其他版本重跑",
+                  flush=True,
+              )
+              sys.exit(res.returncode)
           PY
 
           echo "Downloaded files:"
           ls -lh wheels
+
+          if ls wheels/*.tar.gz >/dev/null 2>&1; then
+            echo "::warning::下载内容含源码包（sdist），离线安装时目标机需具备构建环境（pip/setuptools/wheel 等）"
+          fi
 
       - name: Upload wheels artifact
         uses: actions/upload-artifact@v4
