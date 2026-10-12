@@ -95,13 +95,23 @@ jobs:
                   flush=True,
               )
               sys.exit(res.returncode)
+
+          # 产物里若含 sdist，补下常见构建后端，让离线机器无需联网也能构建（配合 install.sh）
+          if any(f.endswith(".tar.gz") for f in os.listdir("wheels")):
+              extra = [
+                  sys.executable, "-m", "pip", "download",
+                  "--dest", "wheels", "--only-binary=:all:",
+                  "setuptools", "wheel",
+              ]
+              print("附带下载构建依赖:", " ".join(extra), flush=True)
+              subprocess.check_call(extra)
           PY
 
           echo "Downloaded files:"
           ls -lh wheels
 
           if ls wheels/*.tar.gz >/dev/null 2>&1; then
-            echo "::warning::下载内容含源码包（sdist），离线安装时目标机需具备构建环境（pip/setuptools/wheel 等）"
+            echo "::warning::下载内容含源码包（sdist），体积/安装请配合仓库根目录的 install.sh（会用 --no-index 从本地目录构建）"
           fi
 
       - name: Upload wheels artifact
