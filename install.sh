@@ -84,7 +84,7 @@ while [ $# -gt 0 ]; do
 done
 
 case $MODE in tool|venv|pip) ;; *) die "--mode 只能是 tool / venv / pip，收到: $MODE" ;; esac
-[ "$LIST_ONLY" = 1 ] || [ "$DRY_RUN" = 1 ] || [ ${#PACKAGES[@]} -gt 0 ] || { usage; die "请至少指定一个包名"; }
+[ "$LIST_ONLY" = 1 ] || [ ${#PACKAGES[@]} -gt 0 ] || { usage; die "请至少指定一个包名（--list 除外）"; }
 
 PYTHON_PATH=$(command -v "$PYTHON" 2>/dev/null || true)
 [ -n "$PYTHON_PATH" ] || die "找不到解释器: $PYTHON"
@@ -254,7 +254,7 @@ case $MODE in
       die "mode=tool 需要构建 sdist（${SDIST_NAMES[*]}），但产物里没有 setuptools wheel。
      请在 CI 的 packages 输入里加上 'setuptools wheel' 重新下载，或改用 -m venv 模式。"
     fi
-    CMD=(uv tool install --no-index --offline --find-links "$WHEELS" "${BUILD_FLAG[@]}" --python "$PYTHON" "${PACKAGES[@]}")
+    CMD=(uv tool install --no-index --offline --find-links "$WHEELS" "${BUILD_FLAG[@]+"${BUILD_FLAG[@]}"}" --python "$PYTHON" "${PACKAGES[@]}")
     log "执行: ${CMD[*]}"
     run "${CMD[@]}"
     if [ "$DRY_RUN" = 0 ]; then
@@ -287,9 +287,9 @@ case $MODE in
       VENV_PY=$(venv_python)
     fi
     if [ "$HAVE_UV" = 1 ]; then
-      CMD=(uv pip install --python "$VENV_PY" --no-index --offline --find-links "$WHEELS" "${BUILD_FLAG[@]}" "${PACKAGES[@]}")
+      CMD=(uv pip install --python "$VENV_PY" --no-index --offline --find-links "$WHEELS" "${BUILD_FLAG[@]+"${BUILD_FLAG[@]}"}" "${PACKAGES[@]}")
     else
-      CMD=("$VENV_PY" -m pip install --no-index --find-links "$WHEELS" --disable-pip-version-check "${BUILD_FLAG[@]}" "${PACKAGES[@]}")
+      CMD=("$VENV_PY" -m pip install --no-index --find-links "$WHEELS" --disable-pip-version-check "${BUILD_FLAG[@]+"${BUILD_FLAG[@]}"}" "${PACKAGES[@]}")
     fi
     check_build_backend "$VENV_PY"
     log "执行: ${CMD[*]}"
@@ -298,9 +298,9 @@ case $MODE in
     ;;
   pip)
     if "$PYTHON" -m pip --version >/dev/null 2>&1; then
-      CMD=("$PYTHON" -m pip install --no-index --find-links "$WHEELS" --disable-pip-version-check "${BUILD_FLAG[@]}" "${PACKAGES[@]}")
+      CMD=("$PYTHON" -m pip install --no-index --find-links "$WHEELS" --disable-pip-version-check "${BUILD_FLAG[@]+"${BUILD_FLAG[@]}"}" "${PACKAGES[@]}")
     elif [ "$HAVE_UV" = 1 ]; then
-      CMD=(uv pip install --python "$PYTHON" --no-index --offline --find-links "$WHEELS" "${BUILD_FLAG[@]}" "${PACKAGES[@]}")
+      CMD=(uv pip install --python "$PYTHON" --no-index --offline --find-links "$WHEELS" "${BUILD_FLAG[@]+"${BUILD_FLAG[@]}"}" "${PACKAGES[@]}")
     else
       die "既没有 pip 也没有 uv 可用于 $PYTHON"
     fi
