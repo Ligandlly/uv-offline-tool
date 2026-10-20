@@ -113,12 +113,16 @@ unzip qwenpaw-hub-py3.12.zip
 
 ## Workflow 的下载逻辑
 
-1. **第一轮：只要 wheel** —— `pip download --dest wheels --only-binary=:all: <packages>`。
-   产物最干净，离线安装无需任何构建。
-2. **第二轮：放宽** —— 只要有包没有 wheel（如 `oss2`、`crcmod`、`alibabacloud-tea` 只发布 sdist），自动改为「优先 wheel，缺 wheel 时用 sdist」重试，并在日志里 `::warning::` 指出是哪些包。
-3. **附带构建依赖** —— 若产物里出现 `.tar.gz`，再补下载 `setuptools`、`wheel`，保证离线机器能构建这些 sdist。
-4. 若两轮都失败，报错并提示原因（如 Python 版本不满足包的 `requires-python`，例如 `qwenpaw` 只支持 `3.11 ≤ x < 3.14`）。
-5. **打包** —— 把 `wheels/` 压成 `<artifact 名>-wheels.tar.gz`，连同仓库里的 `install.sh` 一起上传；下载下来只用一份 artifact 就能离线安装。
+1. **按 glibc 基线交叉下载 wheel** —— `pip download --only-binary=:all: --platform manylinux_2_28_x86_64 --python-version 3.12 --implementation cp --abi cp312 --abi abi3 --abi none <packages>`。
+   让 pip 只在「不高于基线」的 wheel 里挑（`glibc_baseline` 可选 `manylinux2014`/`2_17`、`2_28`、`2_34`、`native`），
+   避免在 ubuntu-latest（glibc 2.39）上把 `manylinux_2_34` 这种高 glibc 的 wheel 塞进产物。产物最干净，离线安装无需任何构建。
+2. **放宽 + 兼容化** —— 若有包只发布 sdist（如 `oss2`、`crcmod`、`alibabacloud-tea`）而无法全程走 wheel，则改为正常下载（缺 wheel 时用 sdist），
+   然后把 glibc 要求高于基线的 wheel **换成同版本的更低基线变体**（如 `cryptography-…-manylinux_2_34` → `cryptography-…-manylinux_2_28`）。
+3. **点名无法兼容的包** —— 若某个版本根本没有低 glibc 变体（如只发布 `manylinux_2_34`），日志 `::warning::` 会点名，
+   `*-compat.txt` 里也有记录，提示改用更高的 `glibc_baseline` 或把该包固定到更旧版本。
+4. **附带构建依赖** —— 若产物里出现 `.tar.gz`/`.zip`，再补下载 `setuptools`、`wheel`，保证离线机器能构建这些 sdist。
+5. 若两轮都失败，报错并提示原因（如 Python 版本不满足包的 `requires-python`，例如 `qwenpaw` 只支持 `3.11 ≤ x < 3.14`）。
+6. **打包** —— 把 `wheels/` 压成 `<artifact 名>-wheels.tar.gz`，连同 `install.sh`、`*-compat.txt` 一起上传。
 
 ## 常见问题
 
@@ -128,8 +132,20 @@ unzip qwenpaw-hub-py3.12.zip
 **Q: 报 `No matching distribution found for qwenpaw[hub] (from versions: none)`？**
 Python 版本不符合包的 `requires-python`。`qwenpaw` 只支持 3.11~3.13，用 3.14 必然失败，改用 `python_version=3.12` 重跑。
 
+**Q: 离线机上报 `Could not find a version that satisfies the requirement cryptography>=43.0.0`？**
+产物里那个 `cryptography-50.0.2-cp311-abi3-manylinux_2_34_x86_64.whl` 要求 **glibc ≥ 2.34**（Ubuntu 22.04+），而离线机 glibc 更旧
+（CentOS 7 = 2.17、Ubuntu 20.04 = 2.31、Debian 11 = 2.31……），pip 就会认为「没有任何可用版本」，即使 wheel 就在目录里。
+
+现在：
+
+- `install.sh` 的预检查会直接点名：`wheel 与目标环境不匹配: cryptography-…-manylinux_2_34_x86_64.whl -> 需要 glibc>=2.34（本机 glibc 2.31）`；
+- workflow 默认 `glibc_baseline=manylinux_2_28`，会自动把这类 wheel 换成同版本的更低 glibc 变体；
+  产物 zip 里的 `*-compat.txt` 记录了本次基线，以及**确实没有低 glibc 变体**的包（这些包需要升级系统或固定更旧版本）。
+
+离线机 glibc 特别老（如 CentOS 7）时，把 `glibc_baseline` 改小为 `manylinux2014` 重跑；日志会点名仍然只有高 glibc wheel 的包。
+
 **Q: 离线机上装不上，提示 wheel 与平台不匹配？**
-产物是在 CI 的 `ubuntu-latest` 上按指定 Python 版本下载的（例如 `cp312-manylinux_2_17_x86_64`）。离线机需与之匹配：同架构（x86_64/aarch64）、同 Python 次版本。`install.sh --list` 会做一次预检查和告警。若目标机不是 Linux x86_64，请调整 workflow 的 `runs-on`。
+产物是在 CI 的 `ubuntu-latest` 上按指定 Python 版本 + `glibc_baseline` 下载的（例如 `cp312-…-manylinux_2_28_x86_64`）。离线机需与之匹配：同架构（x86_64/aarch64）、同 Python 次版本、glibc 不低于基线。`install.sh --list` 会把不匹配的 wheel 逐个点名并给出原因（glibc / Python / 架构）。若目标机不是 Linux x86_64，请调整 workflow 的 `runs-on`。
 
 **Q: 提示 `目标环境缺少 setuptools，离线状态下无法构建 sdist`？**
 旧产物里没带构建依赖。两个办法：重新跑一次 workflow（新版会自动附带 `setuptools wheel`，推荐），或在 CI 的 `packages` 里显式写上 `setuptools wheel`。

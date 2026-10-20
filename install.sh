@@ -211,7 +211,7 @@ SDISTS=("$WHEELS"/*.tar.gz)
 shopt -u nullglob
 [ ${#WHLS[@]} -gt 0 ] || [ ${#SDISTS[@]} -gt 0 ] || die "$WHEELS 里没有 .whl/.tar.gz"
 
-PY_DESC=$("$PYTHON" -c 'import platform,sys; print(f"{platform.python_implementation()} {platform.python_version()} ({sys.platform}-{platform.machine()})")')
+PY_DESC=$("$PYTHON" -c 'import platform,sys; v=platform.libc_ver()[1] or "n/a"; print(f"{platform.python_implementation()} {platform.python_version()} ({sys.platform}-{platform.machine()}), glibc {v}")')
 
 log "产物目录 : $WHEELS"
 log "wheel 数 : ${#WHLS[@]}"
@@ -254,6 +254,136 @@ if [ ${#WHLS[@]} -gt 0 ] && [ -n "$TAGS" ]; then
     warn "产物里的 wheel 与当前解释器/平台不匹配（$PY_DESC）。"
     warn "请确认离线机的 Python 版本和系统架构与 CI 下载时一致（如 cp312 + manylinux x86_64）。"
   fi
+fi
+
+# 逐个数出「装不上的 wheel + 原因」。pip 遇到不匹配的 wheel 只会给一句
+# 'Could not find a version that satisfies the requirement xxx (from versions: none)'，
+# 这里提前把真实原因（glibc / Python ABI / 架构）指出来，省得离线机靠猜。
+mismatch=$(
+  "$PYTHON" - "$WHEELS" <<'PY' 2>/dev/null || true
+import os
+import platform
+import re
+import sys
+
+wheels_dir = sys.argv[1]
+PY = sys.version_info[:2]
+LEGACY = {"manylinux1": (2, 5), "manylinux2010": (2, 12), "manylinux2014": (2, 17)}
+ARCH = platform.machine()
+
+
+def local_glibc():
+    try:
+        v = platform.libc_ver()[1]
+        if v:
+            return tuple(int(x) for x in v.split(".")[:2])
+    except Exception:
+        pass
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.gnu_get_libc_version.restype = ctypes.c_char_p
+        return tuple(int(x) for x in libc.gnu_get_libc_version().decode().split(".")[:2])
+    except Exception:
+        return None
+
+
+GLIBC = local_glibc()
+
+
+def plat_info(tag):
+    """平台标签 -> (glibc 要求, 架构, 类型)"""
+    if tag == "any":
+        return (0, 0), None, "any"
+    m = re.fullmatch(r"(manylinux|musllinux)_(\d+)_(\d+)_(.+)", tag)
+    if m:
+        flavor, maj, mnr, arch = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+        return ((maj, mnr) if flavor == "manylinux" else None), arch, flavor
+    m = re.fullmatch(r"(manylinux\d+|linux|macosx|win)(?:_(.+))?", tag)
+    if m:
+        key, arch = m.group(1), m.group(2)
+        flavor = "manylinux" if key.startswith("manylinux") else key
+        return LEGACY.get(key), arch, flavor
+    return None, None, "?"
+
+
+def arch_ok(info):
+    arch = info[1]
+    return arch is None or arch == ARCH or arch.endswith("_" + ARCH) or arch.split("_")[-1] == ARCH
+
+
+def reasons(fname):
+    parts = fname[:-4].split("-")
+    if len(parts) < 5:
+        return []
+    pytag, abi, plat = parts[-3], parts[-2], parts[-1]
+    out = []
+
+    # Python / ABI
+    py_ok = False
+    needs = []
+    abi3 = "abi3" in abi
+    for t in pytag.split("."):
+        m = re.fullmatch(r"([a-z]+)(\d)(\d*)", t)
+        if not m:
+            continue
+        impl, major, minor = m.group(1), int(m.group(2)), int(m.group(3) or 0)
+        if impl == "py":
+            if major == PY[0] and minor == 0:
+                py_ok = True
+            else:
+                needs.append(f"{major}.{minor or 'x'}")
+        elif abi3:
+            if PY >= (major, minor):
+                py_ok = True
+            else:
+                needs.append(f">={major}.{minor}")
+        else:
+            if PY == (major, minor):
+                py_ok = True
+            else:
+                needs.append(f"{major}.{minor}")
+    if not py_ok:
+        need = " / ".join(dict.fromkeys(needs)) or pytag
+        out.append(f"需要 Python {need}（本机 {PY[0]}.{PY[1]}）")
+
+    # 平台 / glibc
+    infos = [plat_info(p) for p in plat.split(".")]
+    if not any(i[0] == (0, 0) for i in infos):
+        cands = [i for i in infos if arch_ok(i)]
+        if not cands:
+            archs = ", ".join(sorted({i[1] or "?" for i in infos}))
+            out.append(f"架构不匹配（wheel: {archs}，本机: {ARCH}）")
+        else:
+            gl = [i[0] for i in cands if i[0]]
+            if GLIBC and gl and all(g > GLIBC for g in gl):
+                need = min(gl)
+                out.append(f"需要 glibc>={need[0]}.{need[1]}（本机 glibc {GLIBC[0]}.{GLIBC[1]}）")
+            elif not gl and all(i[2] == "musllinux" for i in cands):
+                out.append("是 musl 平台 wheel（本机是 glibc）")
+    return out
+
+
+for fname in sorted(os.listdir(wheels_dir)):
+    if not fname.endswith(".whl"):
+        continue
+    why = reasons(fname)
+    if why:
+        print(f"{fname}\t" + "；".join(why))
+PY
+)
+if [ -n "$mismatch" ]; then
+  shown=0; total=0
+  while IFS=$'\t' read -r wname why; do
+    [ -n "$wname" ] || continue
+    total=$((total + 1))
+    if [ "$shown" -lt 8 ]; then warn "wheel 与目标环境不匹配: $wname -> $why"; shown=$((shown + 1)); fi
+  done <<<"$mismatch"
+  [ "$total" -gt "$shown" ] && warn "另有 $((total - shown)) 个不匹配的 wheel（同类问题，未全部列出）"
+  warn "pip 会直接忽略这些 wheel，最终报 'Could not find a version that satisfies the requirement xxx (from versions: none)'。"
+  warn "对策：让离线机的 Python 次版本 / 架构 / glibc 与产物一致；或重跑 workflow 并选择更低的"
+  warn "      glibc_baseline（如 manylinux2014 / manylinux_2_28），生成更通用的产物。"
 fi
 
 # 需要构建的 sdist：优先保持构建隔离（构建依赖也从本地目录解析），
@@ -314,6 +444,15 @@ run() {
   if [ "$DRY_RUN" = 1 ]; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi
 }
 
+run_install() {   # 安装失败时补一句「怎么救」，pip 自己的报错只说找不到版本
+  run "$@" && return 0
+  warn "安装失败。若报 'Could not find a version that satisfies the requirement xxx'，"
+  warn "通常是产物里的 wheel 与离线机不匹配（看上面的「wheel 与目标环境不匹配」）："
+  warn "  - glibc 太旧：重跑 workflow，把 glibc_baseline 改小（如 manylinux2014），生成更通用的产物；"
+  warn "  - Python 次版本/架构不同：用 -p 指定与产物一致的解释器，或按对应版本重新生成产物。"
+  return 1
+}
+
 # ---------- 安装 ----------
 case $MODE in
   tool)
@@ -323,7 +462,7 @@ case $MODE in
     fi
     CMD=(uv tool install --no-index --offline --find-links "$WHEELS" "${BUILD_FLAG[@]+"${BUILD_FLAG[@]}"}" --python "$PYTHON" "${PACKAGES[@]}")
     log "执行: ${CMD[*]}"
-    run "${CMD[@]}"
+    run_install "${CMD[@]}"
     if [ "$DRY_RUN" = 0 ]; then
       log ""
       log "已安装的 uv tool:"
@@ -360,7 +499,7 @@ case $MODE in
     fi
     check_build_backend "$VENV_PY"
     log "执行: ${CMD[*]}"
-    run "${CMD[@]}"
+    run_install "${CMD[@]}"
     [ "$DRY_RUN" = 0 ] && log "完成。激活: source \"$VENV_DIR/bin/activate\"（Windows: $VENV_DIR\\Scripts\\activate）"
     ;;
   pip)
@@ -373,7 +512,7 @@ case $MODE in
     fi
     check_build_backend "$PYTHON"
     log "执行: ${CMD[*]}"
-    run "${CMD[@]}"
+    run_install "${CMD[@]}"
     ;;
 esac
 

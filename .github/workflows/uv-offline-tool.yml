@@ -7,6 +7,16 @@ on:
         description: "Python 版本，例如 3.12（注意包自身的 requires-python，如 qwenpaw 仅支持 3.11~3.13）"
         required: true
         default: "3.12"
+      glibc_baseline:
+        description: "离线机 glibc 基线：越小越通用（manylinux2014=glibc≥2.17，manylinux_2_28=2.28，manylinux_2_34=2.34，native=不限制）"
+        required: true
+        type: choice
+        options:
+          - manylinux2014
+          - manylinux_2_28
+          - manylinux_2_34
+          - native
+        default: manylinux_2_28
       packages:
         description: "包名，多个用空格分隔，例如：ruff black mypy（需要固定版本可写成 qwenpaw==2.2.1）"
         required: true
@@ -28,6 +38,8 @@ jobs:
       - name: Download wheels
         env:
           PACKAGES: ${{ inputs.packages }}
+          GLIBC_BASELINE: ${{ inputs.glibc_baseline }}
+          PY_VERSION: ${{ inputs.python_version }}
         run: |
           set -euo pipefail
 
@@ -36,15 +48,101 @@ jobs:
 
           python - <<'PY'
           import os
+          import platform
           import re
           import shlex
+          import shutil
           import subprocess
           import sys
+          import tempfile
 
           packages = shlex.split(os.environ.get("PACKAGES", ""))
 
           if not packages:
               sys.exit("packages is empty")
+
+          baseline_in = (os.environ.get("GLIBC_BASELINE") or "manylinux_2_28").strip().lower()
+          py_version = (os.environ.get("PY_VERSION") or "").strip() or \
+              f"{sys.version_info.major}.{sys.version_info.minor}"
+          py_tag = "cp" + py_version.replace(".", "")
+          arch = platform.machine()      # ubuntu-latest: x86_64（aarch64 runner 时为 aarch64）
+
+          LEGACY = {"manylinux1": (2, 5), "manylinux2010": (2, 12), "manylinux2014": (2, 17)}
+          USAGE = "manylinux2014 / manylinux_2_28 / manylinux_2_34 / native"
+
+          def baseline_glibc(spec):
+              """manylinux_2_28 / 2_28 / manylinux2014 -> (2,28) / (2,17)；native -> None"""
+              if spec in ("", "native", "none", "any"):
+                  return None
+              m = re.fullmatch(r"(?:manylinux_)?(\d+)_(\d+)", spec)
+              if m:
+                  return int(m.group(1)), int(m.group(2))
+              if spec in LEGACY:
+                  return LEGACY[spec]
+              sys.exit(f"glibc_baseline 取值不支持: {spec}（可用: {USAGE}）")
+
+          BASELINE = baseline_glibc(baseline_in)
+
+          def platform_tags(baseline):
+              """基线 -> 全部 <= 基线的 --platform 标签。
+
+              pip 的 --platform 不会自己向下展开（m anylinux_2_28_x86_64 只有它自己，
+              manylinux2014_x86_64 才展开出 2010/1），所以这里把 2_28…2_5 以及
+              manylinux2014/2010/1 这些别名全显式列出来，否则像
+              playwright（py3-none-manylinux1_x86_64）会被误判为不可用。
+              """
+              if baseline is None:
+                  return []
+              low = 5 if arch in ("x86_64", "i686", "amd64") else 17
+              tags = [f"manylinux_2_{m}_{arch}" for m in range(baseline[1], low - 1, -1)]
+              for name, ver in sorted(LEGACY.items(), key=lambda kv: -kv[1][1]):
+                  if ver <= baseline:
+                      tags.append(f"{name}_{arch}")
+              tags.append(f"linux_{arch}")
+              return tags
+
+          PLATFORMS = platform_tags(BASELINE)
+          TARGET = PLATFORMS[0] if PLATFORMS else None
+          TARGET_DESC = (
+              f"glibc>={BASELINE[0]}.{BASELINE[1]}（{arch}，最低标签 {PLATFORMS[-2]}）"
+              if BASELINE else "native（不限制平台）"
+          )
+
+          # 用 --platform 交叉下载：pip 会在「不高于该基线」的 wheel 里挑最合适的一个，
+          # 避免在 ubuntu-latest（glibc 2.39）上把 manylinux_2_34 这种高 glibc wheel 装进产物。
+          EMU = []
+          if PLATFORMS:
+              EMU = ["--python-version", py_version, "--implementation", "cp",
+                     "--abi", py_tag, "--abi", "abi3", "--abi", "none"]
+              for p in PLATFORMS:
+                  EMU += ["--platform", p]
+
+          def plat_glibc(tag):
+              """平台标签 -> 要求的最低 glibc；any/linux_* -> (0,0)；musl 等不可比 -> None"""
+              if tag in ("any",) or tag.startswith("linux_"):
+                  return (0, 0)
+              m = re.fullmatch(r"manylinux_(\d+)_(\d+)_.*", tag)
+              if m:
+                  return int(m.group(1)), int(m.group(2))
+              m = re.fullmatch(r"(manylinux\d+)_.*", tag)
+              if m and m.group(1) in LEGACY:
+                  return LEGACY[m.group(1)]
+              return None
+
+          def wheel_glibc(fname):
+              """wheel 要求的最低 glibc（多个平台标签取最小）；无法判断 -> None"""
+              vals = [plat_glibc(p) for p in fname[:-4].split("-")[-1].split(".")]
+              vals = [v for v in vals if v is not None]
+              return min(vals) if vals else None
+
+          def too_new(fname):
+              """超出 glibc 基线时返回它要求的最低 glibc，否则 None"""
+              if TARGET is None:
+                  return None
+              need = wheel_glibc(fname)
+              if need is None or need <= BASELINE:
+                  return None
+              return need
 
           # pip 在 "只要 wheel" 模式下会把没有 wheel 的包报成这两种错误
           REQ_RE = re.compile(
@@ -54,13 +152,20 @@ jobs:
 
           def name_of(spec):
               # oss2[kerberos]>=2.19.1 -> oss2
-              return re.split(r"[\[\]<>=!~;]", spec, 1)[0]
+              return re.split(r"[\[\]<>=!~; ]", spec, maxsplit=1)[0]
 
-          def run(only_binary):
-              cmd = [sys.executable, "-m", "pip", "download", "--dest", "wheels"]
+          def lacking_of(res):
+              return sorted({name_of(m.group(1)) for m in REQ_RE.finditer(res.stdout + res.stderr)})
+
+          def run(specs, dest, only_binary=True, no_deps=False, emulated=False):
+              cmd = [sys.executable, "-m", "pip", "download", "--dest", dest]
               if only_binary:
                   cmd.append("--only-binary=:all:")
-              cmd += packages
+              if no_deps:
+                  cmd.append("--no-deps")
+              if emulated and EMU:
+                  cmd += EMU
+              cmd += list(specs)
               print("Running:", " ".join(cmd), flush=True)
               return subprocess.run(cmd, capture_output=True, text=True, errors="replace")
 
@@ -68,52 +173,142 @@ jobs:
               print(res.stdout, end="", flush=True)
               print(res.stderr, end="", file=sys.stderr, flush=True)
 
-          # 第一轮：只要 wheel（最理想的离线产物）
-          res = run(only_binary=True)
-          show(res)
+          def files(dest, suffix):
+              if not os.path.isdir(dest):
+                  return []
+              return sorted(f for f in os.listdir(dest) if f.endswith(suffix))
 
-          # 第二轮：只要有包没 wheel，就放宽为「优先 wheel、必要时用 sdist」
-          if res.returncode != 0:
-              lacking = sorted(
-                  {
-                      name_of(m.group(1))
-                      for m in REQ_RE.finditer(res.stdout + res.stderr)
-                  }
-              )
-              if lacking:
+          report = [f"目标 Python: {py_version} ({py_tag})", f"目标平台: {TARGET_DESC}"]
+
+          print(f"目标 Python : {py_version} ({py_tag})", flush=True)
+          print(f"目标平台    : {TARGET_DESC}", flush=True)
+
+          # ---- 第一轮：按 glibc 基线交叉下载纯 wheel（最理想：干净 + 老系统可用）----
+          ok = False
+          if TARGET:
+              res = run(packages, "wheels", emulated=True)
+              show(res)
+              if res.returncode == 0:
+                  ok = True
+                  print(f"::notice::全部依赖都取到了 {TARGET_DESC} 可用的 wheel", flush=True)
+                  report.append("全部依赖均为 wheel，且 glibc 要求不高于基线。")
+              else:
+                  lacking = lacking_of(res)
                   print(
-                      "::warning::以下包没有可用 wheel（或当前 Python 版本不兼容），"
-                      "已放宽为允许 sdist 重试: " + " ".join(lacking),
+                      "基线下载未成功（常见原因：部分包只发布 sdist，或只提供更高 glibc 的 wheel）"
+                      + ("，涉及: " + " ".join(lacking) if lacking else ""),
                       flush=True,
                   )
-              else:
-                  print("::warning::未找到纯 wheel 方案，已放宽为允许 sdist 重试", flush=True)
-              res = run(only_binary=False)
+                  print(
+                      "::warning::改为「先正常下载，再把 glibc 要求过高的 wheel 换成同版本的更低基线变体」",
+                      flush=True,
+                  )
+                  shutil.rmtree("wheels", ignore_errors=True)
+                  os.makedirs("wheels", exist_ok=True)
+
+          # ---- 第二轮：正常下载（必要时允许 sdist），然后把高 glibc wheel 兼容化 ----
+          if not ok:
+              shutil.rmtree("raw", ignore_errors=True)
+              res = run(packages, "raw")
               show(res)
 
-          if res.returncode != 0:
-              print(
-                  "::error::下载失败；若日志提示 'require a different python version'，"
-                  "说明当前 Python 版本不满足包的 requires-python 约束，请改用其他版本重跑",
-                  flush=True,
-              )
-              sys.exit(res.returncode)
+              if res.returncode != 0:
+                  lacking = lacking_of(res)
+                  if lacking:
+                      print(
+                          "::warning::以下包没有可用 wheel（或当前 Python 版本不兼容），"
+                          "已放宽为允许 sdist 重试: " + " ".join(lacking),
+                          flush=True,
+                      )
+                  else:
+                      print("::warning::未找到纯 wheel 方案，已放宽为允许 sdist 重试", flush=True)
+                  res = run(packages, "raw", only_binary=False)
+                  show(res)
 
-          # 产物里若含 sdist，补下常见构建后端，让离线机器无需联网也能构建（配合 install.sh）
-          if any(f.endswith(".tar.gz") for f in os.listdir("wheels")):
-              extra = [
-                  sys.executable, "-m", "pip", "download",
-                  "--dest", "wheels", "--only-binary=:all:",
-                  "setuptools", "wheel",
-              ]
-              print("附带下载构建依赖:", " ".join(extra), flush=True)
-              subprocess.check_call(extra)
+              if res.returncode != 0:
+                  print(
+                      "::error::下载失败；若日志提示 'require a different python version'，"
+                      "说明当前 Python 版本不满足包的 requires-python 约束，请改用其他版本重跑",
+                      flush=True,
+                  )
+                  sys.exit(res.returncode)
+
+              os.makedirs("wheels", exist_ok=True)
+              problems = []
+              for f in files("raw", ".whl"):
+                  src = os.path.join("raw", f)
+                  need = too_new(f)
+                  if need is None:
+                      shutil.copy2(src, "wheels")
+                      got = wheel_glibc(f)
+                      if TARGET and got:
+                          report.append(f"{f}: glibc>={got[0]}.{got[1]}")
+                      continue
+
+                  parts = f[:-4].split("-")
+                  spec = f"{parts[0]}=={parts[1]}"
+                  tmp = tempfile.mkdtemp()
+                  replaced = None
+                  try:
+                      r = run([spec], tmp, no_deps=True, emulated=True)
+                      better = [g for g in files(tmp, ".whl") if too_new(g) is None]
+                      if r.returncode == 0 and better:
+                          replaced = better[0]
+                          shutil.copy2(os.path.join(tmp, replaced), "wheels")
+                  finally:
+                      shutil.rmtree(tmp, ignore_errors=True)
+
+                  if replaced:
+                      print(f"  兼容化: {f} -> {replaced}", flush=True)
+                      report.append(f"{replaced}: 已兼容化（原 {f} 需 glibc>={need[0]}.{need[1]}）")
+                  else:
+                      problems.append((f, need))
+                      shutil.copy2(src, "wheels")
+
+              # 只发布 sdist 的包（如 oss2 / alibabacloud-tea）原样带进产物
+              for f in files("raw", ".tar.gz") + files("raw", ".zip"):
+                  shutil.copy2(os.path.join("raw", f), "wheels")
+
+              if problems:
+                  lines = [
+                      f"以下 wheel 没有 glibc<={BASELINE[0]}.{BASELINE[1]} 的同版本变体，"
+                      f"离线机的 glibc 必须满足其要求："
+                  ]
+                  lines += [f"  {f}  -> 需要 glibc>={n[0]}.{n[1]}" for f, n in problems]
+                  text = "\n".join(lines)
+                  print(text, flush=True)
+                  print(
+                      "::warning::部分 wheel 需要更高的 glibc: "
+                      + ", ".join(f"{f} (glibc>={n[0]}.{n[1]})" for f, n in problems)
+                      + "；离线机 glibc 不足时安装会报 'Could not find a version that satisfies ...'。"
+                      "可把 glibc_baseline 改为 manylinux_2_34 / native 后重跑（离线机需相应 glibc），"
+                      "或把该包固定到更旧的版本。",
+                      flush=True,
+                  )
+                  report += [""] + lines
+              else:
+                  report.append("所有 wheel 的 glibc 要求都不高于基线。")
+
+          # ---- 产物里若含 sdist，补下常见构建后端，让离线机器无需联网也能构建（配合 install.sh）----
+          if files("wheels", ".tar.gz") or files("wheels", ".zip"):
+              res = run(["setuptools", "wheel"], "wheels", emulated=bool(TARGET))
+              show(res)
+              if res.returncode != 0:
+                  print("::error::构建依赖（setuptools/wheel）下载失败", flush=True)
+                  sys.exit(res.returncode)
+
+          if TARGET and not ok:
+              shutil.rmtree("raw", ignore_errors=True)
+
+          with open("compat-report.txt", "w", encoding="utf-8") as fh:
+              fh.write("\n".join(report) + "\n")
+
           PY
 
           echo "Downloaded files:"
           ls -lh wheels
 
-          if ls wheels/*.tar.gz >/dev/null 2>&1; then
+          if ls wheels/*.tar.gz wheels/*.zip >/dev/null 2>&1; then
             echo "::warning::下载内容含源码包（sdist），体积/安装请配合仓库根目录的 install.sh（会用 --no-index 从本地目录构建）"
           fi
 
@@ -144,6 +339,8 @@ jobs:
           tar -czf "dist/${NAME}-wheels.tar.gz" -C . wheels
           cp install.sh "dist/install.sh"
           chmod +x "dist/install.sh"
+          # 记录本次产物的 Python / glibc 基线，方便离线机排查不匹配
+          if [ -f compat-report.txt ]; then cp compat-report.txt "dist/${NAME}-compat.txt"; fi
           echo "产物内容:"
           ls -lh dist
 
